@@ -31,3 +31,7 @@ computer, but it can reach the internet and anything the machine can.
 - Set `delete_after` so machines from an eval that was killed delete
   themselves, and use `inspect sandbox cleanup boxd` to find any that are
   left.
+- `inspect sandbox cleanup boxd` without an id sees every machine in the org
+  with the label `inspect-sandbox=boxd`, also those of other people's evals.
+  It keeps machines that are running or starting. Set
+  `BOXD_INSPECT_CLEANUP_RUNNING=1` only when no eval is running in the org.

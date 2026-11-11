@@ -13,6 +13,10 @@ First release.
   `ready_timeout` and `compose_timeout`. Also accepted as a JSON file.
 - `exec` with `input`, `cwd`, `env`, `user` and `timeout`; `read_file` and `write_file`
   with `user`; `connection()`; `inspect sandbox cleanup boxd [id]`.
+- `inspect sandbox cleanup boxd` covers all regions of the org and keeps machines that are
+  in use, unless `BOXD_INSPECT_CLEANUP_RUNNING=1`.
+- Each eval keeps its own record of the machines it made, so two evals in one process
+  only delete their own.
 - Passes Inspect's portable sandbox checks on the machine and in Debian and Alpine
   compose services.
 - Four examples: a quick start, a Docker task run unchanged, Docker inside each sample,

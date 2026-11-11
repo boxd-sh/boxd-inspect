@@ -14,6 +14,6 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeMachines]:
     machines = FakeMachines()
     client = FakeClient(machines)
     monkeypatch.setattr(_environment, "_make_client", lambda region: client)
-    token = _environment._machines.set({})
+    token = _environment._unscoped.set(None)
     yield machines
-    _environment._machines.reset(token)
+    _environment._unscoped.reset(token)

@@ -118,6 +118,12 @@ sandbox = SandboxEnvironmentSpec(
 The API key is read from `BOXD_API_KEY` (or `BOXD_TOKEN`) only. A key in the configuration
 would end up in the eval log.
 
+| Environment variable | Means |
+| --- | --- |
+| `BOXD_API_KEY` | The API key. |
+| `BOXD_REGION`, `BOXD_ORG` | The defaults for `region` and `org`. `inspect sandbox cleanup boxd` lists the machines of `BOXD_ORG`. |
+| `BOXD_INSPECT_CLEANUP_RUNNING` | Set to `1` and `inspect sandbox cleanup boxd` also deletes machines that are in use. |
+
 ## What is supported
 
 | Inspect | On boxd |
@@ -128,7 +134,7 @@ would end up in the eval log.
 | Sample `files` and `setup` | Yes. |
 | Several sandboxes per sample | Yes, as services of one compose file in one machine. |
 | `connection()` (for example the human agent) | The `boxd connect <machine>` command, and the service as `container`. |
-| `inspect sandbox cleanup boxd [id]` | Deletes one machine made by this package, or every machine with `inspect-sandbox=boxd` that the key can see (it asks first in a terminal). |
+| `inspect sandbox cleanup boxd [id]` | With an id: deletes that machine, if this package made it. Without: lists every machine with `inspect-sandbox=boxd` in the org, in all regions, and deletes the ones that are not in use. See [Clean up](#clean-up). |
 
 Every check in Inspect's portable sandbox suite (`inspect_ai.util._sandbox.self_check`)
 passes on the machine and in Debian and Alpine compose services. A container running as root
@@ -158,6 +164,8 @@ fails the sample it happens in, and its machine is still deleted.
 | `user=` names a user that doesn't exist | `SandboxUserUnsupportedError` |
 | The machine was deleted while the sample ran | `SandboxUnavailableError` |
 | Deleting a machine failed | a warning in the log; the machine is tried again when the task ends |
+| `inspect sandbox cleanup boxd <id>` with an id that doesn't exist, or of a machine this package didn't make | a message, exit code 1, nothing deleted |
+| `inspect sandbox cleanup boxd` couldn't list a region, or a delete failed | a message naming the region or machine, exit code 1; the rest is still cleaned up |
 
 A command that exits non-zero is not an error: `exec` returns its exit code, stdout and
 stderr, as in every Inspect sandbox.
@@ -176,6 +184,7 @@ stderr, as in every Inspect sandbox.
 | Compose directory | 512 MiB, sent to the machine as one archive |
 | Machine name prefix | 1 to 20 lowercase letters, digits or `-`, starting with a letter |
 | Regions | `fra` and `nyc` |
+| `inspect sandbox cleanup boxd` | one org (`BOXD_ORG`, or the key's), all its regions; machines that are running or starting are kept unless `BOXD_INSPECT_CLEANUP_RUNNING=1` |
 
 ## How it works
 
@@ -194,7 +203,8 @@ stderr, as in every Inspect sandbox.
   --wait` starts it inside the machine. Each running service becomes one sandbox, reached
   with `docker compose exec`.
 - When the sample ends, fails or is cancelled, its machine is deleted. Every machine id the
-  task made is recorded, and any left over is deleted by id when the task ends.
+  eval made is recorded, and any left over is deleted by id when the eval ends. The record
+  belongs to one eval: two evals in the same process never delete each other's machines.
 
 ## Examples
 
@@ -223,8 +233,22 @@ python examples/from_snapshot.py
 A sample's machine is deleted when the sample ends, also when it fails or is cancelled.
 Machines whose samples did not clean up are deleted, by id, when the task ends. With
 `--no-sandbox-cleanup` the machines stay and their ids are printed. If the eval process is
-killed, its machines stay. Delete them with `inspect sandbox cleanup boxd`, or set
-`delete_after` so boxd does it for you.
+killed, its machines stay. Set `delete_after` so boxd deletes them for you, or delete them
+yourself:
+
+```sh
+inspect sandbox cleanup boxd <id>                               # one machine
+inspect sandbox cleanup boxd                                    # every machine that is not in use
+BOXD_INSPECT_CLEANUP_RUNNING=1 inspect sandbox cleanup boxd     # the ones in use too
+```
+
+Without an id, the command lists every machine with the label `inspect-sandbox=boxd` in the
+org, in all regions. That includes machines of evals other people in the org are running
+right now. So it only deletes machines that are stopped, hibernated, in standby or failed,
+and keeps the ones that are running or starting. A machine of a killed eval is still
+running: delete it by id, or set `BOXD_INSPECT_CLEANUP_RUNNING=1` when you know no eval is
+running in the org. In a terminal the command asks before it deletes. In a script or in CI
+it doesn't ask.
 
 New machines start fresh, so a compose service's images are pulled for each sample. For big
 images, prepare a machine once, save it as a snapshot and pass `from_snapshot`
@@ -245,8 +269,9 @@ BOXD_API_KEY=bxd_... uv run pytest -m live         # real machines
 The live tests run Inspect's portable sandbox checks on a machine and in three compose
 setups, plus lifecycle and error tests. They create machines named `t-inspect-*`, labelled
 `boxd-inspect=live-test`, each with a one-hour `delete_after`, and delete them again.
-`BOXD_INSPECT_TEST_REGION` (default `nyc`) picks the region. They are skipped when
-`BOXD_API_KEY` is not set.
+`BOXD_INSPECT_TEST_REGION` (default `nyc`) picks the region. Set
+`BOXD_INSPECT_TEST_OTHER_REGION` to a second region to also test cleanup across regions.
+They are skipped when `BOXD_API_KEY` is not set. No live test runs the cleanup without an id.
 
 ## Resources
 

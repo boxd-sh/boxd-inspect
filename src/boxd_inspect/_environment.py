@@ -72,21 +72,59 @@ EXEC_SLACK = 15
 
 _now = time.monotonic
 
-_run_id: ContextVar[str | None] = ContextVar("boxd_run_id", default=None)
+CLEANUP_RUNNING_ENV = "BOXD_INSPECT_CLEANUP_RUNNING"
+"""Set to ``1`` and ``inspect sandbox cleanup boxd`` also deletes machines in use."""
+
+AT_REST = frozenset({"suspended", "hibernated", "stopped", "failed"})
+"""Statuses of a machine no eval is using. Any other status counts as in use."""
+
 _clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str | None, AsyncBoxd]] = (
     weakref.WeakKeyDictionary()
 )
 """Clients per event loop and region: a client cannot outlive the loop it was made on."""
-_machines: ContextVar[dict[str, str | None] | None] = ContextVar("boxd_machines", default=None)
-"""Machines this task made and has not deleted yet (id to region). Set in
-``task_init``, so two evals in one process keep their own lists."""
-_untracked: dict[str, str | None] = {}
-"""The same, for samples started without ``task_init``."""
 
 
-def _tracked() -> dict[str, str | None]:
-    machines = _machines.get()
-    return machines if machines is not None else _untracked
+class _Registry:
+    """What one eval made: its run id and the machines it has not deleted yet."""
+
+    def __init__(self) -> None:
+        self.run_id = uuid.uuid4().hex[:12]
+        self.machines: dict[str, str | None] = {}
+        """Machine id to region."""
+
+
+_unscoped: ContextVar[_Registry | None] = ContextVar("boxd_registry", default=None)
+"""The registry when Inspect gives no state for the eval: the sandbox used
+directly, or an Inspect version without that state."""
+
+
+def _scope() -> Any:
+    """Inspect's state for the running eval, or None when there is none."""
+    try:
+        from inspect_ai.util._sandbox.lifecycle import sandbox_lifecycle_state
+    except ImportError:
+        return None
+    return sandbox_lifecycle_state()
+
+
+def _registry() -> _Registry:
+    """Return the running eval's registry.
+
+    It lives on the state Inspect keeps for the eval, which every task of the
+    eval shares, so a ``task_init`` that runs late in another task sees the
+    same machines and run id as the samples. Two evals in one process have
+    their own state, and so their own registries. Without that state the
+    registry belongs to the current context and is never shared.
+    """
+    scope = _scope()
+    if scope is not None:
+        scoped: _Registry = scope.get(_Registry)
+        return scoped
+    registry = _unscoped.get()
+    if registry is None:
+        registry = _Registry()
+        _unscoped.set(registry)
+    return registry
 
 
 class _Output:
@@ -344,12 +382,12 @@ class BoxdSandboxEnvironment(SandboxEnvironment):
         resolved, compose = resolve_config(config)
         if compose is not None:
             await anyio.to_thread.run_sync(compose_source, compose)
-        _run_id.set(uuid.uuid4().hex[:12])
-        _machines.set({})
+        if _scope() is None:
+            _unscoped.set(_Registry())
         client = _client(resolved.region)
         await client.machines.list(
             org=_org(resolved),
-            labels={SANDBOX_LABEL: "boxd", "inspect-run": _current_run_id()},
+            labels={SANDBOX_LABEL: "boxd", "inspect-run": _registry().run_id},
             region=resolved.region,
         )
 
@@ -367,7 +405,7 @@ class BoxdSandboxEnvironment(SandboxEnvironment):
         labels = {
             **resolved.labels,
             SANDBOX_LABEL: "boxd",
-            "inspect-run": _current_run_id(),
+            "inspect-run": _registry().run_id,
             "inspect-task": _slug(task_name, 200) or "task",
         }
         # Shielded: a machine created while the sample is cancelled is still
@@ -416,7 +454,7 @@ class BoxdSandboxEnvironment(SandboxEnvironment):
         cls, task_name: str, config: SandboxEnvironmentConfigType | None, cleanup: bool
     ) -> None:
         """Delete the machines whose samples did not clean up (by id, never by search)."""
-        machines = _tracked()
+        machines = _registry().machines
         if not machines:
             return
         if not cleanup:
@@ -431,44 +469,82 @@ class BoxdSandboxEnvironment(SandboxEnvironment):
     @override
     @classmethod
     async def cli_cleanup(cls, id: str | None) -> None:
-        """``inspect sandbox cleanup boxd [id]``: one machine, or all made by this package."""
+        """``inspect sandbox cleanup boxd [id]``: one machine, or those no eval is using.
+
+        Without an id it lists every machine made by this package, in all
+        regions, and deletes the ones at rest. Machines in use (running or
+        starting) may belong to an eval that is still going, so they are kept
+        unless ``BOXD_INSPECT_CLEANUP_RUNNING=1``.
+        """
         client = _client(os.environ.get("BOXD_REGION") or None)
+        org = os.environ.get("BOXD_ORG") or None
         if id is not None:
-            try:
-                machine = await client.machines.get(id)
-            except NotFoundError:
+            machine = await _find(client, id, org)
+            if machine is None:
                 print(f"No boxd machine {id}.")
                 sys.exit(1)
             if machine.labels.get(SANDBOX_LABEL) != "boxd":
                 print(f"{id} was not made by boxd-inspect (no {SANDBOX_LABEL}=boxd label): kept.")
                 sys.exit(1)
-            await client.machines.delete(id)
+            await client.machines.delete(id, region=machine.region)
             print(f"Deleted boxd machine {id}")
             return
-        machines = await client.machines.list(
-            org=os.environ.get("BOXD_ORG") or None, labels={SANDBOX_LABEL: "boxd"}
-        )
+        machines = await client.machines.list(org=org, labels={SANDBOX_LABEL: "boxd"}, region="all")
+        unreachable = list(machines.unavailable)
+        if unreachable:
+            print(
+                f"Could not list region(s) {', '.join(unreachable)}: their machines are not shown."
+            )
         if not machines:
             print("No boxd machines made by boxd-inspect.")
+            if unreachable:
+                sys.exit(1)
             return
         for machine in machines:
-            print(f"{machine.id}  {machine.name}  {machine.status}")
+            print(f"{machine.id}  {machine.name}  {machine.region or '-'}  {machine.status}")
+        doomed = list(machines)
+        if os.environ.get(CLEANUP_RUNNING_ENV) != "1":
+            doomed = [machine for machine in machines if machine.status in AT_REST]
+            kept = len(machines) - len(doomed)
+            if kept:
+                print(
+                    f"Keeping {kept} machine(s) in use: an eval may still be running on them. "
+                    f"Delete one with: inspect sandbox cleanup boxd <id>. "
+                    f"Delete all of them with {CLEANUP_RUNNING_ENV}=1."
+                )
+        if not doomed:
+            print("Nothing to delete.")
+            if unreachable:
+                sys.exit(1)
+            return
         interactive = sys.stdin.isatty() and "CI" not in os.environ
         if interactive:
-            answer = input(f"Delete these {len(machines)} machine(s)? [y/N] ")
+            answer = input(f"Delete {len(doomed)} machine(s)? [y/N] ")
             if answer.strip().lower() not in ("y", "yes"):
                 print("Cancelled.")
                 return
         failed = 0
-        for machine in machines:
+        for machine in doomed:
             try:
-                await client.machines.delete(machine.id)
+                await client.machines.delete(machine.id, region=machine.region)
             except BoxdError as error:
                 failed += 1
                 print(f"Could not delete {machine.id}: {error}")
-        print(f"Deleted {len(machines) - failed} machine(s).")
-        if failed:
+        print(f"Deleted {len(doomed) - failed} machine(s).")
+        if failed or unreachable:
             sys.exit(1)
+
+
+async def _find(client: AsyncBoxd, machine_id: str, org: str | None) -> Any:
+    """Find the machine with this id, in the client's region or any other."""
+    try:
+        return await client.machines.get(machine_id)
+    except NotFoundError:
+        pass
+    for machine in await client.machines.list(org=org, region="all"):
+        if machine.id == machine_id:
+            return machine
+    return None
 
 
 async def _create(
@@ -486,7 +562,7 @@ async def _create(
         delete_after=config.delete_after,
         region=config.region,
     )
-    _tracked()[machine.id] = config.region
+    _registry().machines[machine.id] = config.region
     return machine
 
 
@@ -589,7 +665,7 @@ async def _delete(client: AsyncBoxd, machine_id: str, region: str | None) -> Non
         except Exception as error:
             logger.warning(f"Could not delete boxd machine {machine_id}: {error}")
             return
-    _tracked().pop(machine_id, None)
+    _registry().machines.pop(machine_id, None)
 
 
 def _client(region: str | None) -> AsyncBoxd:
@@ -612,14 +688,6 @@ def _make_client(region: str | None) -> AsyncBoxd:
 
 def _org(config: BoxdSandboxEnvironmentConfig) -> str | None:
     return config.org or os.environ.get("BOXD_ORG") or None
-
-
-def _current_run_id() -> str:
-    run_id = _run_id.get()
-    if run_id is None:
-        run_id = uuid.uuid4().hex[:12]
-        _run_id.set(run_id)
-    return run_id
 
 
 _SLUG = re.compile(r"[^a-z0-9]+")

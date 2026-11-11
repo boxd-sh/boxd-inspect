@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from boxd import NotFoundError
+from boxd.models import RegionalList
 
 
 @dataclass
@@ -54,6 +55,9 @@ class FakeMachines:
     chunk_size: int = 1024 * 1024
     chunks_read: int = 0
     exec_delay: float = 0.0
+    existing: list[Any] = field(default_factory=list)
+    unavailable: list[str] = field(default_factory=list)
+    deleted_in: dict[str, str | None] = field(default_factory=dict)
 
     async def create(self, name: str, **kwargs: Any) -> Any:
         machine = SimpleNamespace(id=f"id-{len(self.created) + 1}", name=name, status="pending")
@@ -85,14 +89,34 @@ class FakeMachines:
     async def get(self, machine_id: str, **_: Any) -> Any:
         if machine_id not in self.labels:
             raise NotFoundError("VM not found")  # type: ignore[no-untyped-call]
-        return SimpleNamespace(id=machine_id, labels=self.labels.get(machine_id, {}))
+        return SimpleNamespace(id=machine_id, labels=self.labels.get(machine_id, {}), region=None)
 
-    async def delete(self, machine_id: str, **_: Any) -> None:
+    async def delete(self, machine_id: str, *, region: str | None = None, **_: Any) -> None:
         self.deleted.append(machine_id)
+        self.deleted_in[machine_id] = region
 
-    async def list(self, **kwargs: Any) -> list[Any]:
+    async def list(self, **kwargs: Any) -> RegionalList[Any]:
+        """``existing``, filtered as the API does: by labels, and by region unless it is "all"."""
         self.listed.append(kwargs)
-        return []
+        labels = kwargs.get("labels") or {}
+        region = kwargs.get("region")
+        found = [
+            machine
+            for machine in self.existing
+            if all(machine.labels.get(key) == value for key, value in labels.items())
+            and (region == "all" or machine.region == region)
+        ]
+        return RegionalList(found, unavailable=self.unavailable if region == "all" else [])
+
+
+def existing_machine(
+    machine_id: str, status: str, region: str = "nyc", made_by_us: bool = True
+) -> Any:
+    """A machine the fake's ``list`` returns."""
+    labels = {"inspect-sandbox": "boxd"} if made_by_us else {}
+    return SimpleNamespace(
+        id=machine_id, name=f"inspect-{machine_id}", status=status, region=region, labels=labels
+    )
 
 
 class FakeStream:

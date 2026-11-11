@@ -4,6 +4,7 @@ import asyncio
 import errno
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from boxd import BoxdError, NotFoundError
@@ -16,7 +17,7 @@ from inspect_ai.util import (
 
 from boxd_inspect import BoxdSandboxEnvironment, BoxdSandboxEnvironmentConfig, _environment
 from boxd_inspect._environment import machine_name
-from tests.fakes import FakeMachines, Result
+from tests.fakes import FakeMachines, Result, existing_machine
 
 CONFIG = BoxdSandboxEnvironmentConfig(region="nyc", name_prefix="t-test")
 
@@ -78,14 +79,14 @@ async def test_a_machine_that_never_gets_ready_is_deleted(fake: FakeMachines) ->
     with pytest.raises(TimeoutError):
         await make(fake)
     assert fake.deleted == ["id-1"]
-    assert _environment._tracked() == {}
+    assert _environment._registry().machines == {}
 
 
 async def test_sample_cleanup_deletes_by_id(fake: FakeMachines) -> None:
     env = await make(fake)
     await BoxdSandboxEnvironment.sample_cleanup("my_task", CONFIG, {"default": env}, False)
     assert fake.deleted == ["id-1"]
-    assert _environment._tracked() == {}
+    assert _environment._registry().machines == {}
 
 
 async def test_task_cleanup_deletes_what_samples_left(fake: FakeMachines) -> None:
@@ -111,7 +112,7 @@ async def test_a_failed_delete_only_warns(fake: FakeMachines) -> None:
 
     fake.delete = broken  # type: ignore[method-assign]
     await BoxdSandboxEnvironment.sample_cleanup("my_task", CONFIG, {"default": env}, False)
-    assert "id-1" in _environment._tracked()
+    assert "id-1" in _environment._registry().machines
 
 
 async def test_the_home_directory_is_passable_for_other_users(fake: FakeMachines) -> None:
@@ -365,15 +366,171 @@ async def test_cleanup_by_id_only_deletes_machines_made_by_this_package(
     assert fake.deleted == ["mine"]
 
 
-async def test_two_tasks_keep_their_own_machines(fake: FakeMachines) -> None:
+async def test_two_tasks_keep_their_own_machines_without_inspects_state(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def task(name: str) -> dict[str, str | None]:
         await BoxdSandboxEnvironment.task_init(name, CONFIG)
         await BoxdSandboxEnvironment.sample_init(name, CONFIG, {})
-        return dict(_environment._tracked())
+        return dict(_environment._registry().machines)
 
+    monkeypatch.setattr(_environment, "_scope", lambda: None)
     first, second = await asyncio.gather(task("a"), task("b"))
     assert len(first) == len(second) == 1
     assert first != second
+
+
+async def test_a_late_task_init_in_another_task_keeps_each_evals_machines_apart(
+    fake: FakeMachines,
+) -> None:
+    """Inspect can run ``task_init`` in a task next to the samples. Two evals in
+    one process must still only delete their own machines."""
+    from inspect_ai.util._sandbox.lifecycle import sandbox_lifecycle_scope
+
+    async def one_eval(ready: asyncio.Event, finish: asyncio.Event) -> str:
+        with sandbox_lifecycle_scope():
+            await asyncio.create_task(BoxdSandboxEnvironment.task_init("startup", CONFIG))
+            envs = await asyncio.create_task(BoxdSandboxEnvironment.sample_init("t", CONFIG, {}))
+            ready.set()
+            await finish.wait()
+            await BoxdSandboxEnvironment.task_cleanup("shutdown", CONFIG, cleanup=True)
+            return envs["default"].as_type(BoxdSandboxEnvironment).machine_id
+
+    ready = [asyncio.Event(), asyncio.Event()]
+    finish = [asyncio.Event(), asyncio.Event()]
+    first = asyncio.create_task(one_eval(ready[0], finish[0]))
+    second = asyncio.create_task(one_eval(ready[1], finish[1]))
+    await ready[0].wait()
+    await ready[1].wait()
+
+    # Each eval has one run id, the same in task_init and in its samples.
+    listed = [call["labels"]["inspect-run"] for call in fake.listed]
+    created = [machine["labels"]["inspect-run"] for machine in fake.created]
+    assert sorted(listed) == sorted(created)
+    assert created[0] != created[1]
+
+    finish[0].set()
+    first_id = await first
+    assert fake.deleted == [first_id]
+    finish[1].set()
+    second_id = await second
+    assert fake.deleted == [first_id, second_id]
+
+
+async def test_a_sample_without_task_init_is_never_tracked_in_shared_state(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without Inspect's state (the import guard's fallback) a sample's machine
+    stays in its own context: another eval's cleanup cannot see it."""
+    monkeypatch.setattr(_environment, "_scope", lambda: None)
+    envs = await asyncio.create_task(BoxdSandboxEnvironment.sample_init("t", CONFIG, {}))
+    await BoxdSandboxEnvironment.task_cleanup("shutdown", CONFIG, cleanup=True)
+    assert fake.deleted == []
+    await BoxdSandboxEnvironment.sample_cleanup("t", CONFIG, envs, False)
+    assert fake.deleted == ["id-1"]
+
+
+def test_an_inspect_without_lifecycle_state_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "inspect_ai.util._sandbox.lifecycle", None)
+    assert _environment._scope() is None
+
+
+# --- inspect sandbox cleanup boxd ---
+
+
+def leftovers(fake: FakeMachines) -> None:
+    fake.existing = [
+        existing_machine("resting", "hibernated"),
+        existing_machine("busy", "running"),
+        existing_machine("booting", "starting"),
+        existing_machine("far", "stopped", region="fra"),
+        existing_machine("not-ours", "stopped", made_by_us=False),
+    ]
+
+
+async def test_bulk_cleanup_keeps_machines_in_use(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("BOXD_INSPECT_CLEANUP_RUNNING", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    leftovers(fake)
+    await BoxdSandboxEnvironment.cli_cleanup(None)
+    assert fake.deleted == ["resting", "far"]
+    output = capsys.readouterr().out
+    assert "Keeping 2 machine(s) in use" in output
+    assert "busy" in output
+    assert "Deleted 2 machine(s)." in output
+
+
+async def test_bulk_cleanup_covers_every_region(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOXD_REGION", "nyc")
+    leftovers(fake)
+    await BoxdSandboxEnvironment.cli_cleanup(None)
+    assert fake.listed[-1]["region"] == "all"
+    assert fake.deleted_in == {"resting": "nyc", "far": "fra"}
+
+
+async def test_bulk_cleanup_deletes_machines_in_use_when_told_to(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOXD_INSPECT_CLEANUP_RUNNING", "1")
+    leftovers(fake)
+    await BoxdSandboxEnvironment.cli_cleanup(None)
+    assert fake.deleted == ["resting", "busy", "booting", "far"]
+
+
+async def test_bulk_cleanup_asks_first_in_a_terminal(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("BOXD_INSPECT_CLEANUP_RUNNING", raising=False)
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+    asked: list[str] = []
+
+    def answer(prompt: str) -> str:
+        asked.append(prompt)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", answer)
+    leftovers(fake)
+    await BoxdSandboxEnvironment.cli_cleanup(None)
+    assert asked == ["Delete 2 machine(s)? [y/N] "]
+    assert fake.deleted == []
+    assert "Cancelled." in capsys.readouterr().out
+
+
+async def test_bulk_cleanup_with_only_machines_in_use_deletes_nothing(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("BOXD_INSPECT_CLEANUP_RUNNING", raising=False)
+    fake.existing = [existing_machine("busy", "running")]
+    await BoxdSandboxEnvironment.cli_cleanup(None)
+    assert fake.deleted == []
+    assert "Nothing to delete." in capsys.readouterr().out
+
+
+async def test_bulk_cleanup_says_when_a_region_could_not_be_listed(
+    fake: FakeMachines, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("BOXD_INSPECT_CLEANUP_RUNNING", raising=False)
+    leftovers(fake)
+    fake.unavailable = ["fra"]
+    with pytest.raises(SystemExit):
+        await BoxdSandboxEnvironment.cli_cleanup(None)
+    assert fake.deleted == ["resting", "far"]
+    assert "Could not list region(s) fra" in capsys.readouterr().out
+
+
+async def test_cleanup_by_id_finds_a_machine_in_another_region(fake: FakeMachines) -> None:
+    leftovers(fake)
+    await BoxdSandboxEnvironment.cli_cleanup("far")
+    with pytest.raises(SystemExit):
+        await BoxdSandboxEnvironment.cli_cleanup("not-ours")
+    assert fake.deleted_in == {"far": "fra"}
 
 
 async def test_a_cancelled_sample_still_deletes_its_machine(fake: FakeMachines) -> None:

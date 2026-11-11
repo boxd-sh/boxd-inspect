@@ -33,18 +33,15 @@ async def test_eval_with_sample_files(tmp_path: Path, monkeypatch: pytest.Monkey
     machines = local_machine(home)
     client = FakeClient(machines)
     monkeypatch.setattr(_environment, "_make_client", lambda region: client)
-    try:
-        task = Task(
-            dataset=[
-                Sample(input="go", target="42", files={"notes.txt": "copied in first\n"}),
-            ],
-            solver=run_in_sandbox(),
-            scorer=includes(),
-            sandbox=SandboxEnvironmentSpec("boxd", BoxdSandboxEnvironmentConfig(region="nyc")),
-        )
-        (log,) = await eval_async(task, model="mockllm/model", log_dir=str(tmp_path / "logs"))
-    finally:
-        _environment._untracked.clear()
+    task = Task(
+        dataset=[
+            Sample(input="go", target="42", files={"notes.txt": "copied in first\n"}),
+        ],
+        solver=run_in_sandbox(),
+        scorer=includes(),
+        sandbox=SandboxEnvironmentSpec("boxd", BoxdSandboxEnvironmentConfig(region="nyc")),
+    )
+    (log,) = await eval_async(task, model="mockllm/model", log_dir=str(tmp_path / "logs"))
 
     assert log.status == "success", log.error
     assert log.results is not None

@@ -3,7 +3,8 @@
 Gated: ``BOXD_API_KEY=... pytest -m live tests/test_live_lifecycle.py``. Uses the
 same ``BOXD_INSPECT_TEST_REGION`` and ``BOXD_INSPECT_TEST_PREFIX`` as the
 conformance run. ``BOXD_INSPECT_TEST_SNAPSHOT`` names a snapshot to start from,
-for the ``from_snapshot`` check.
+for the ``from_snapshot`` check. ``BOXD_INSPECT_TEST_OTHER_REGION`` names a
+second region, for the cleanup-by-id check across regions.
 """
 
 from __future__ import annotations
@@ -139,6 +140,23 @@ async def test_from_snapshot() -> None:
     try:
         marker = await env.exec(["cat", "/home/boxd/snapshot-marker"])
         assert marker.success, marker.stderr
+    finally:
+        await stop(env, settings)
+
+
+async def test_cleanup_by_id_finds_a_machine_in_another_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other = os.environ.get("BOXD_INSPECT_TEST_OTHER_REGION")
+    if not other:
+        pytest.skip("set BOXD_INSPECT_TEST_OTHER_REGION")
+    monkeypatch.setenv("BOXD_REGION", REGION)
+    settings = config(region=other)
+    env = await start(settings)
+    try:
+        await BoxdSandboxEnvironment.cli_cleanup(env.machine_id)
+        with pytest.raises(NotFoundError):
+            await AsyncBoxd(region=other).machines.get(env.machine_id, region=other)
     finally:
         await stop(env, settings)
 
