@@ -211,14 +211,14 @@ stderr, as in every Inspect sandbox.
 Each one runs against real boxd. They use Claude (`pip install anthropic`,
 `ANTHROPIC_API_KEY`); pass any other model with `--model`.
 
-- [`examples/quickstart.py`](examples/quickstart.py): the task above, one sample on one fresh
+- [`examples/quickstart.py`](https://github.com/boxd-sh/boxd-inspect/blob/main/examples/quickstart.py): the task above, one sample on one fresh
   machine.
-- [`examples/docker_task/`](examples/docker_task/task.py): a task written for Inspect's Docker
+- [`examples/docker_task/`](https://github.com/boxd-sh/boxd-inspect/blob/main/examples/docker_task/task.py): a task written for Inspect's Docker
   sandbox with its own `Dockerfile`, run unchanged with `--sandbox boxd`.
-- [`examples/docker_in_sample.py`](examples/docker_in_sample.py): three samples in parallel,
+- [`examples/docker_in_sample.py`](https://github.com/boxd-sh/boxd-inspect/blob/main/examples/docker_in_sample.py): three samples in parallel,
   each on its own machine, where the agent builds a Docker image, runs it with nginx and
   fetches the page.
-- [`examples/from_snapshot.py`](examples/from_snapshot.py): prepare a machine once (install a
+- [`examples/from_snapshot.py`](https://github.com/boxd-sh/boxd-inspect/blob/main/examples/from_snapshot.py): prepare a machine once (install a
   tool, pull an image), save it as a snapshot, and start every sample from it.
 
 ```sh
@@ -252,7 +252,7 @@ it doesn't ask.
 
 New machines start fresh, so a compose service's images are pulled for each sample. For big
 images, prepare a machine once, save it as a snapshot and pass `from_snapshot`
-(see [`examples/from_snapshot.py`](examples/from_snapshot.py)).
+(see [`examples/from_snapshot.py`](https://github.com/boxd-sh/boxd-inspect/blob/main/examples/from_snapshot.py)).
 
 ## Development
 
