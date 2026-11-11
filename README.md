@@ -1,4 +1,4 @@
-![boxd sandboxes for Inspect AI](assets/banner.png)
+![boxd sandboxes for Inspect AI](https://raw.githubusercontent.com/boxd-sh/boxd-inspect/main/assets/banner.png)
 
 # boxd-inspect
 
